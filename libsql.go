@@ -24,13 +24,14 @@ import (
 	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
-	"golang.org/x/exp/slices"
 	"io"
 	"net/url"
 	"regexp"
 	"strings"
 	"time"
 	"unsafe"
+
+	"golang.org/x/exp/slices"
 
 	"github.com/antlr4-go/antlr/v4"
 	"github.com/libsql/sqlite-antlr4-parser/sqliteparser"
@@ -61,7 +62,7 @@ type Option interface {
 type option func(*config) error
 
 type Replicated struct {
-	FrameNo int
+	FrameNo      int
 	FramesSynced int
 }
 
@@ -155,6 +156,16 @@ func NewEmbeddedReplicaConnector(dbPath string, primaryUrl string, opts ...Optio
 	return openEmbeddedReplicaConnector(dbPath, primaryUrl, authToken, readYourWrites, encryptionKey, syncInterval, config.extensions)
 }
 
+func NewLocalConnector(dbPath string, opts ...Option) (*Connector, error) {
+	cfg := &config{}
+	for _, opt := range opts {
+		if err := opt.apply(cfg); err != nil {
+			return nil, fmt.Errorf("failed to apply option: %w", err)
+		}
+	}
+	return openLocalConnector(dbPath, cfg.extensions)
+}
+
 type driver struct{}
 
 func (d driver) Open(dbAddress string) (sqldriver.Conn, error) {
@@ -167,7 +178,7 @@ func (d driver) Open(dbAddress string) (sqldriver.Conn, error) {
 
 func (d driver) OpenConnector(dbAddress string) (sqldriver.Connector, error) {
 	if strings.HasPrefix(dbAddress, ":memory:") {
-		return openLocalConnector(dbAddress)
+		return openLocalConnector(dbAddress, []extension{})
 	}
 	u, err := url.Parse(dbAddress)
 	if err != nil {
@@ -175,7 +186,7 @@ func (d driver) OpenConnector(dbAddress string) (sqldriver.Connector, error) {
 	}
 	switch u.Scheme {
 	case "file":
-		return openLocalConnector(dbAddress)
+		return openLocalConnector(dbAddress, []extension{})
 	case "http":
 		fallthrough
 	case "https":
@@ -190,7 +201,7 @@ func (d driver) OpenConnector(dbAddress string) (sqldriver.Connector, error) {
 
 func libsqlSync(nativeDbPtr C.libsql_database_t) (Replicated, error) {
 	var errMsg *C.char
-	var rep C.replicated;
+	var rep C.replicated
 	statusCode := C.libsql_sync2(nativeDbPtr, &rep, &errMsg)
 	if statusCode != 0 {
 		return Replicated{0, 0}, libsqlError("failed to sync database ", statusCode, errMsg)
@@ -199,12 +210,30 @@ func libsqlSync(nativeDbPtr C.libsql_database_t) (Replicated, error) {
 	return Replicated{FrameNo: int(rep.frame_no), FramesSynced: int(rep.frames_synced)}, nil
 }
 
-func openLocalConnector(dbPath string) (*Connector, error) {
-	nativeDbPtr, err := libsqlOpenLocal(dbPath)
+func openLocalConnector(dbPath string, extensions []extension) (*Connector, error) {
+	nativeDb, err := libsqlOpenLocal(dbPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
-	return &Connector{nativeDbPtr: nativeDbPtr}, nil
+
+	conn, err := libsqlConnect(nativeDb)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Load extensions if any are specified
+	for _, ext := range extensions {
+		if err := loadExtension(conn, ext.path, ext.entryPoint); err != nil {
+			C.libsql_disconnect(conn)
+			return nil, fmt.Errorf("failed to load extension %s: %w", ext.path, err)
+		}
+	}
+	C.libsql_disconnect(conn)
+
+	return &Connector{
+		nativeDbPtr: nativeDb,
+		extensions:  extensions,
+	}, nil
 }
 
 func openRemoteConnector(primaryUrl, authToken string) (*Connector, error) {
@@ -815,4 +844,23 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []sqldriver.
 		return nil, err
 	}
 	return newRows(rowsNativePtr)
+}
+
+func loadExtension(conn C.libsql_connection_t, path string, entryPoint string) error {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+
+	var cEntryPoint *C.char
+	if entryPoint != "" {
+		cEntryPoint = C.CString(entryPoint)
+		defer C.free(unsafe.Pointer(cEntryPoint))
+	}
+
+	var errMsg *C.char
+	status := C.libsql_load_extension(conn, cPath, cEntryPoint, &errMsg)
+	if status != 0 {
+		defer C.free(unsafe.Pointer(errMsg))
+		return libsqlError("failed to load extension", status, errMsg)
+	}
+	return nil
 }
