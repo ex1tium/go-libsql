@@ -39,7 +39,7 @@ import (
 )
 
 func init() {
-	sql.Register("libsql", driver{})
+	sql.Register("libsql-local", driver{})
 }
 
 type extension struct {
